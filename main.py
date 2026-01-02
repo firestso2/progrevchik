@@ -11,7 +11,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 TOKEN = "8538009406:AAEeDvEKhcn8oI16c-QO7QkyN3CdZZRBbUc"  # Ваш НОВЫЙ токен
 ADMIN_ID = 8416449434                                   # Ваш проверенный ID
 
-# Начальный список каналов для прогрева
+# Начальный список каналов для прогрева из вашего кода
 INITIAL_CHANNELS = [
     -1003563461665, -1003595733582, -1003696903994, -1003671263610, 
     -1003543850773, -1003396466024, -1003638323492, -1003544426070, 
@@ -27,14 +27,17 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher()
 scheduler = AsyncIOScheduler()
 
-# --- ФУНКЦИЯ УВЕДОМЛЕНИЙ АДМИНА ---
-async def send_admin_report(text):
-    try:
-        await bot.send_message(ADMIN_ID, f"🤖 **ОТЧЕТ БОТА**\n{text}", parse_mode="Markdown")
-    except Exception as e:
-        logging.error(f"Ошибка отправки отчета админу: {e}")
+# --- СИСТЕМА УВЕДОМЛЕНИЙ АДМИНА ---
 
-# --- РАБОТА С БАЗОЙ ДАННЫХ ---
+async def send_admin_report(text):
+    """Отправляет отчет вам в личные сообщения"""
+    try:
+        await bot.send_message(ADMIN_ID, f"🤖 **ОТЧЕТ ПРОГРЕВА**\n{text}", parse_mode="Markdown")
+    except Exception as e:
+        logging.error(f"Не удалось отправить отчет админу: {e}")
+
+# --- РАБОТА С БАЗОЙ ДАННЫХ (Полная версия) ---
+
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("""
@@ -62,10 +65,12 @@ async def deactivate_channel(chat_id):
         await db.execute("UPDATE channels SET active = 0 WHERE chat_id = ?", (chat_id,))
         await db.commit()
         logging.warning(f"Канал {chat_id} деактивирован.")
-        await send_admin_report(f"⚠️ Канал `{chat_id}` деактивирован (нет прав).")
+        await send_admin_report(f"⚠️ Канал `{chat_id}` удален из рассылки (нет прав).")
 
-# --- ЛОГИКА ОТПРАВКИ ---
+# --- ЛОГИКА ОТПРАВКИ (С уведомлениями) ---
+
 async def send_publication(post_number):
+    """Отправляет публикацию во все активные каналы и пишет отчет админу"""
     channels = await get_active_channels()
     text = f"Публикация {post_number}"
     success_count = 0
@@ -82,10 +87,11 @@ async def send_publication(post_number):
             if "Forbidden" in str(e) or "chat not found" in str(e).lower():
                 await deactivate_channel(chat_id)
     
-    await send_admin_report(f"✅ Рассылка №{post_number} завершена.\nУспешно: {success_count}/{len(channels)}")
+    await send_admin_report(f"✅ Рассылка №{post_number} завершена.\nУспешно отправлено: {success_count} из {len(channels)} каналов.")
     logging.info(f"--- КОНЕЦ РАССЫЛКИ: {text} ---")
 
-# --- ПЛАНИРОВЩИК ---
+# --- ПЛАНИРОВЩИК (РАНДОМАЙЗЕР) ---
+
 def schedule_jobs_for_today():
     now = datetime.now()
     for job in scheduler.get_jobs():
@@ -116,19 +122,26 @@ def schedule_jobs_for_today():
         logging.info(f"  [{i}] запланировано на {run_date.strftime('%H:%M')}")
 
 async def daily_reschedule():
-    logging.info("Новый день! Генерирую расписание...")
+    logging.info("Генерирую новое расписание...")
     schedule_jobs_for_today()
     await send_admin_report("🔄 Расписание на новый день успешно сформировано!")
 
-# --- АДМИН ПАНЕЛЬ ---
+# --- ОБРАБОТКА КОМАНД (Полная версия) ---
+
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    await message.answer("🚀 Бот-прогревщик запущен и готов к работе!")
+    if message.from_user.id == ADMIN_ID:
+        await message.answer("Вы авторизованы как администратор.")
+
 @dp.message(Command("status"))
 async def cmd_status(message: types.Message):
     if message.from_user.id != ADMIN_ID: return
     channels = await get_active_channels()
-    post_jobs = sorted([j for j in scheduler.get_jobs() if j.id.startswith("post_")], key=lambda x: x.next_run_time)
+    jobs = sorted([j for j in scheduler.get_jobs() if j.id.startswith("post_")], key=lambda x: x.next_run_time)
     
-    response = [f"📊 **Статус бота**", f"Активных каналов: {len(channels)}", f"Постов на сегодня: {len(post_jobs)}"]
-    for job in post_jobs:
+    response = [f"📊 **Статус бота**", f"Активных каналов: {len(channels)}", f"Постов на сегодня: {len(jobs)}"]
+    for job in jobs:
         response.append(f"🕒 {job.next_run_time.strftime('%H:%M')} — {job.args[0]}-я публикация")
     await message.answer("\n".join(response), parse_mode="Markdown")
 
@@ -140,24 +153,34 @@ async def cmd_force_post(message: types.Message):
         num = int(args[1]) if len(args) > 1 else 1
         await message.answer(f"🚀 Запускаю принудительную рассылку №{num}...")
         await send_publication(num)
+        await message.answer("✅ Принудительная рассылка завершена.")
     except Exception as e:
         await message.answer(f"Ошибка: {e}")
 
+@dp.message(Command("regenerate"))
+async def cmd_regenerate(message: types.Message):
+    if message.from_user.id != ADMIN_ID: return
+    schedule_jobs_for_today()
+    await message.answer("🔄 Расписание на сегодня пересоздано. Проверьте /status")
+
 # --- ЗАПУСК ---
+
 async def main():
     await init_db()
+    
+    # Сброс вебхуков для предотвращения TelegramConflictError
+    await bot.delete_webhook(drop_pending_updates=True) 
+    
     scheduler.start()
     scheduler.add_job(daily_reschedule, 'cron', hour=0, minute=5)
     schedule_jobs_for_today()
     
-    # СБРОС СТАРЫХ СОЕДИНЕНИЙ (Убирает ошибку Conflict)
-    await bot.delete_webhook(drop_pending_updates=True) 
-    await send_admin_report("🚀 Бот запущен на сервере Bothost!")
+    await send_admin_report("🚀 Бот успешно запущен на сервере Bothost!")
     
     try:
         await dp.start_polling(bot)
     except Exception as e:
-        logging.error(f"Бот упал: {e}")
+        logging.error(f"Критическая ошибка: {e}")
 
 if __name__ == "__main__":
     asyncio.run(main())
